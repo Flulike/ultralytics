@@ -12,6 +12,8 @@ __all__ = (
     "Conv2",
     "LightConv",
     "DWConv",
+    'DSConv',
+    "SPDConv",
     "DWConvTranspose2d",
     "ConvTranspose",
     "Focus",
@@ -105,6 +107,29 @@ class DWConv(Conv):
     def __init__(self, c1, c2, k=1, s=1, d=1, act=True):  # ch_in, ch_out, kernel, stride, dilation, activation
         """Initialize Depth-wise convolution with given parameters."""
         super().__init__(c1, c2, k, s, g=math.gcd(c1, c2), d=d, act=act)
+
+class DSConv(nn.Module):
+    """Depthwise Separable Convolution"""
+    def __init__(self, c1, c2, k=1, s=1, d=1, act=True) -> None:
+        super().__init__()
+        
+        self.dwconv = DWConv(c1, c1, 3)
+        self.pwconv = Conv(c1, c2, 1)
+    
+    def forward(self, x):
+        return self.pwconv(self.dwconv(x))
+    
+class SPDConv(nn.Module):
+    # Changing the dimension of the Tensor
+    def __init__(self, inc, ouc, dimension=1):
+        super().__init__()
+        self.d = dimension
+        self.conv = Conv(inc * 4, ouc, k=3)
+
+    def forward(self, x):
+        x = torch.cat([x[..., ::2, ::2], x[..., 1::2, ::2], x[..., ::2, 1::2], x[..., 1::2, 1::2]], 1)
+        x = self.conv(x)
+        return x
 
 
 class DWConvTranspose2d(nn.ConvTranspose2d):

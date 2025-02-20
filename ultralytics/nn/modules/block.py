@@ -4,10 +4,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from collections import OrderedDict
 
-from ultralytics.utils.torch_utils import fuse_conv_and_bn
+# from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
-from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
+# from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
+from .conv import Conv, DWConv, GhostConv, LightConv, RepConv
 from .transformer import TransformerBlock
 
 __all__ = (
@@ -32,6 +34,13 @@ __all__ = (
     "BottleneckCSP",
     "Proto",
     "RepC3",
+    'ConvNormLayer',
+    'WTConvNormLayer',
+    'BasicBlock',
+    'BottleNeck',
+    'Blocks',
+    'FrequencyFocusedDownSampling',
+    'SemanticAlignmenCalibration',
     "ResNetLayer",
     "RepNCSPELAN4",
     "ELAN1",
@@ -385,6 +394,550 @@ class ResNetBlock(nn.Module):
     def forward(self, x):
         """Forward pass through the ResNet block."""
         return F.relu(self.cv3(self.cv2(self.cv1(x))) + self.shortcut(x))
+    
+def get_activation(act: str, inpace: bool=True):
+    '''get activation
+    '''
+    act = act.lower()
+    
+    if act == 'silu':
+        m = nn.SiLU()
+
+    elif act == 'relu':
+        m = nn.ReLU()
+
+    elif act == 'leaky_relu':
+        m = nn.LeakyReLU()
+
+    elif act == 'silu':
+        m = nn.SiLU()
+    
+    elif act == 'gelu':
+        m = nn.GELU()
+        
+    elif act is None:
+        m = nn.Identity()
+    
+    elif isinstance(act, nn.Module):
+        m = act
+
+    else:
+        raise RuntimeError('')  
+
+    if hasattr(m, 'inplace'):
+        m.inplace = inpace
+    
+    return m 
+
+class ConvNormLayer(nn.Module):
+    def __init__(self, ch_in, ch_out, kernel_size, stride, padding=None, bias=False, act=None):
+        super().__init__()
+        self.conv = nn.Conv2d(
+            ch_in, 
+            ch_out, 
+            kernel_size, 
+            stride, 
+            padding=(kernel_size-1)//2 if padding is None else padding, 
+            bias=bias)
+        self.norm = nn.BatchNorm2d(ch_out)
+        self.act = nn.Identity() if act is None else get_activation(act)
+
+    def forward(self, x):
+        return self.act(self.norm(self.conv(x)))
+    
+    def forward_fuse(self, x):
+        """Perform transposed convolution of 2D data."""
+        return self.act(self.conv(x)) 
+
+
+class BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, ch_in, ch_out, stride, shortcut, act='relu', variant='d'):
+        super().__init__()
+
+        self.shortcut = shortcut
+
+        if not shortcut:
+            if variant == 'd' and stride == 2:
+                self.short = nn.Sequential(OrderedDict([
+                    ('pool', nn.AvgPool2d(2, 2, 0, ceil_mode=True)),
+                    ('conv', ConvNormLayer(ch_in, ch_out, 1, 1))
+                ]))
+            else:
+                self.short = ConvNormLayer(ch_in, ch_out, 1, stride)
+
+        self.branch2a = ConvNormLayer(ch_in, ch_out, 3, stride, act=act)
+        self.branch2b = ConvNormLayer(ch_out, ch_out, 3, 1, act=None)
+        self.act = nn.Identity() if act is None else get_activation(act) 
+
+
+    def forward(self, x):
+        out = self.branch2a(x)
+        out = self.branch2b(out)
+        if self.shortcut:
+            short = x
+        else:
+            short = self.short(x)
+        
+        out = out + short
+        out = self.act(out)
+
+        return out
+
+
+class BottleNeck(nn.Module):
+    expansion = 4
+
+    def __init__(self, ch_in, ch_out, stride, shortcut, act='relu', variant='d'):
+        super().__init__()
+
+        if variant == 'a':
+            stride1, stride2 = stride, 1
+        else:
+            stride1, stride2 = 1, stride
+
+        width = ch_out 
+
+        self.branch2a = ConvNormLayer(ch_in, width, 1, stride1, act=act)
+        self.branch2b = ConvNormLayer(width, width, 3, stride2, act=act)
+        self.branch2c = ConvNormLayer(width, ch_out * self.expansion, 1, 1)
+
+        self.shortcut = shortcut
+        if not shortcut:
+            if variant == 'd' and stride == 2:
+                self.short = nn.Sequential(OrderedDict([
+                    ('pool', nn.AvgPool2d(2, 2, 0, ceil_mode=True)),
+                    ('conv', ConvNormLayer(ch_in, ch_out * self.expansion, 1, 1))
+                ]))
+            else:
+                self.short = ConvNormLayer(ch_in, ch_out * self.expansion, 1, stride)
+
+        self.act = nn.Identity() if act is None else get_activation(act) 
+
+    def forward(self, x):
+        out = self.branch2a(x)
+        out = self.branch2b(out)
+        out = self.branch2c(out)
+
+        if self.shortcut:
+            short = x
+        else:
+            short = self.short(x)
+
+        out = out + short
+        out = self.act(out)
+
+        return out
+
+
+class Blocks(nn.Module):
+    def __init__(self, ch_in, ch_out, block, count, stage_num, act='relu', input_resolution=None, sr_ratio=None, kernel_size=None, kan_name=None, variant='d'):
+        super().__init__()
+
+        self.blocks = nn.ModuleList()
+        for i in range(count):
+            if input_resolution is not None and sr_ratio is not None:
+                self.blocks.append(
+                    block(
+                        ch_in, 
+                        ch_out,
+                        stride=2 if i == 0 and stage_num != 2 else 1, 
+                        shortcut=False if i == 0 else True,
+                        variant=variant,
+                        act=act,
+                        input_resolution=input_resolution,
+                        sr_ratio=sr_ratio)
+                )
+            elif kernel_size is not None:
+                self.blocks.append(
+                    block(
+                        ch_in, 
+                        ch_out,
+                        stride=2 if i == 0 and stage_num != 2 else 1, 
+                        shortcut=False if i == 0 else True,
+                        variant=variant,
+                        act=act,
+                        kernel_size=kernel_size)
+                )
+            elif kan_name is not None:
+                self.blocks.append(
+                    block(
+                        ch_in, 
+                        ch_out,
+                        stride=2 if i == 0 and stage_num != 2 else 1, 
+                        shortcut=False if i == 0 else True,
+                        variant=variant,
+                        act=act,
+                        kan_name=kan_name)
+                )
+            else:
+                self.blocks.append(
+                    block(
+                        ch_in, 
+                        ch_out,
+                        stride=2 if i == 0 and stage_num != 2 else 1, 
+                        shortcut=False if i == 0 else True,
+                        variant=variant,
+                        act=act)
+                )
+            if i == 0:
+                ch_in = ch_out * block.expansion
+
+    def forward(self, x):
+        out = x
+        for block in self.blocks:
+            out = block(out)
+        return out
+    
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.autograd import Function
+import dill as pickle
+
+import pywt
+import pywt.data
+
+
+def create_wavelet_filter(wave, in_size, out_size, type=torch.float):
+    w = pywt.Wavelet(wave)
+    dec_hi = torch.tensor(w.dec_hi[::-1], dtype=type)
+    dec_lo = torch.tensor(w.dec_lo[::-1], dtype=type)
+    dec_filters = torch.stack([dec_lo.unsqueeze(0) * dec_lo.unsqueeze(1),
+                               dec_lo.unsqueeze(0) * dec_hi.unsqueeze(1),
+                               dec_hi.unsqueeze(0) * dec_lo.unsqueeze(1),
+                               dec_hi.unsqueeze(0) * dec_hi.unsqueeze(1)], dim=0)
+
+    dec_filters = dec_filters[:, None].repeat(in_size, 1, 1, 1)
+
+    rec_hi = torch.tensor(w.rec_hi[::-1], dtype=type).flip(dims=[0])
+    rec_lo = torch.tensor(w.rec_lo[::-1], dtype=type).flip(dims=[0])
+    rec_filters = torch.stack([rec_lo.unsqueeze(0) * rec_lo.unsqueeze(1),
+                               rec_lo.unsqueeze(0) * rec_hi.unsqueeze(1),
+                               rec_hi.unsqueeze(0) * rec_lo.unsqueeze(1),
+                               rec_hi.unsqueeze(0) * rec_hi.unsqueeze(1)], dim=0)
+
+    rec_filters = rec_filters[:, None].repeat(out_size, 1, 1, 1)
+
+    return dec_filters, rec_filters
+
+def wavelet_transform(x, filters):
+    b, c, h, w = x.shape
+    pad = (filters.shape[2] // 2 - 1, filters.shape[3] // 2 - 1)
+    x = F.conv2d(x, filters.to(x.device), stride=2, groups=c, padding=pad)
+    x = x.reshape(b, c, 4, h // 2, w // 2)
+    return x
+
+
+def inverse_wavelet_transform(x, filters):
+    b, c, _, h_half, w_half = x.shape
+    pad = (filters.shape[2] // 2 - 1, filters.shape[3] // 2 - 1)
+    x = x.reshape(b, c * 4, h_half, w_half)
+    x = F.conv_transpose2d(x, filters.to(x.device), stride=2, groups=c, padding=pad)
+    return x
+
+
+# Define the WaveletTransform class
+class WaveletTransform(Function):
+    @staticmethod
+    def forward(ctx, input, filters):
+        ctx.filters = filters
+        with torch.no_grad():
+            x = wavelet_transform(input, filters)
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad = inverse_wavelet_transform(grad_output, ctx.filters)
+        return grad, None
+
+# Define the InverseWaveletTransform class
+class InverseWaveletTransform(Function):
+    @staticmethod
+    def forward(ctx, input, filters):
+        ctx.filters = filters
+        with torch.no_grad():
+            x = inverse_wavelet_transform(input, filters)
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad = wavelet_transform(grad_output, ctx.filters)
+        return grad, None
+
+# Initialize the WaveletTransform
+def wavelet_transform_init(filters):
+    def apply(input):
+        return WaveletTransform.apply(input, filters)
+    return apply
+
+# Initialize the InverseWaveletTransform
+def inverse_wavelet_transform_init(filters):
+    def apply(input):
+        return InverseWaveletTransform.apply(input, filters)
+    return apply
+
+class WTConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=5, stride=1, bias=True, wt_levels=1, wt_type='db1'):
+        super(WTConv2d, self).__init__()
+
+        assert in_channels == out_channels
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels  # 定义 out_channels 属性
+        self.kernel_size = kernel_size
+        self.wt_levels = wt_levels
+        self.bias = bias
+        self.padding = (kernel_size - 1) // 2 #自动计算
+        self.groups = 1
+        
+        self.wt_levels = wt_levels
+        self.stride = stride
+        self.dilation = 1
+
+        self.wt_filter, self.iwt_filter = create_wavelet_filter(wt_type, in_channels, in_channels, torch.float)
+        self.wt_filter = nn.Parameter(self.wt_filter, requires_grad=False)
+        self.iwt_filter = nn.Parameter(self.iwt_filter, requires_grad=False)
+        
+        self.wt_function = wavelet_transform_init(self.wt_filter)
+        self.iwt_function = inverse_wavelet_transform_init(self.iwt_filter)
+
+        self.base_conv = nn.Conv2d(in_channels, in_channels, kernel_size, padding='same', stride=1, dilation=1, groups=in_channels, bias=bias)
+        self.base_scale = _ScaleModule([1,in_channels,1,1])
+
+        self.weight = self.base_conv.weight
+
+        self.wavelet_convs = nn.ModuleList(
+            [nn.Conv2d(in_channels*4, in_channels*4, kernel_size, padding='same', stride=1, dilation=1, groups=in_channels*4, bias=False) for _ in range(self.wt_levels)]
+        )
+        self.wavelet_scale = nn.ModuleList(
+            [_ScaleModule([1,in_channels*4,1,1], init_scale=0.1) for _ in range(self.wt_levels)]
+        )
+
+        if self.stride > 1:
+            self.stride_filter = nn.Parameter(torch.ones(in_channels, 1, 1, 1), requires_grad=False)
+            self.do_stride = lambda x_in: F.conv2d(x_in, self.stride_filter.to(x_in.device), bias=None, stride=self.stride, groups=in_channels)
+        else:
+            self.do_stride = None
+
+    def forward(self, x):
+
+        x_ll_in_levels = []
+        x_h_in_levels = []
+        shapes_in_levels = []
+
+        curr_x_ll = x
+
+        for i in range(self.wt_levels):
+            curr_shape = curr_x_ll.shape
+            shapes_in_levels.append(curr_shape)
+            if (curr_shape[2] % 2 > 0) or (curr_shape[3] % 2 > 0):
+                curr_pads = (0, curr_shape[3] % 2, 0, curr_shape[2] % 2)
+                curr_x_ll = F.pad(curr_x_ll, curr_pads)
+
+            curr_x = self.wt_function(curr_x_ll)
+            curr_x_ll = curr_x[:,:,0,:,:]
+            
+            shape_x = curr_x.shape
+            curr_x_tag = curr_x.reshape(shape_x[0], shape_x[1] * 4, shape_x[3], shape_x[4])
+            curr_x_tag = self.wavelet_scale[i](self.wavelet_convs[i](curr_x_tag))
+            curr_x_tag = curr_x_tag.reshape(shape_x)
+
+            x_ll_in_levels.append(curr_x_tag[:,:,0,:,:])
+            x_h_in_levels.append(curr_x_tag[:,:,1:4,:,:])
+
+        next_x_ll = 0
+
+        for i in range(self.wt_levels-1, -1, -1):
+            curr_x_ll = x_ll_in_levels.pop()
+            curr_x_h = x_h_in_levels.pop()
+            curr_shape = shapes_in_levels.pop()
+
+            curr_x_ll = curr_x_ll + next_x_ll
+
+            curr_x = torch.cat([curr_x_ll.unsqueeze(2), curr_x_h], dim=2)
+            next_x_ll = self.iwt_function(curr_x)
+
+            next_x_ll = next_x_ll[:, :, :curr_shape[2], :curr_shape[3]]
+
+        x_tag = next_x_ll
+        assert len(x_ll_in_levels) == 0
+        
+        x = self.base_scale(self.base_conv(x))
+        x = x + x_tag
+        
+        if self.do_stride is not None:
+            x = self.do_stride(x)
+
+        return x
+
+class _ScaleModule(nn.Module):
+    def __init__(self, dims, init_scale=1.0, init_bias=0):
+        super(_ScaleModule, self).__init__()
+        self.dims = dims
+        self.weight = nn.Parameter(torch.ones(*dims) * init_scale)
+        self.bias = None
+    
+    def forward(self, x):
+        return torch.mul(self.weight, x)
+    
+class WTConvNormLayer(nn.Module):
+    def __init__(self, ch_in, ch_out, kernel_size, stride, padding=None, bias=False, act=None):
+        super().__init__()
+        self.conv = WTConv2d(
+            ch_in, 
+            ch_out, 
+            kernel_size, 
+            stride, 
+            # padding=(kernel_size-1)//2 if padding is None else padding, 
+            bias=bias)
+        self.norm = nn.BatchNorm2d(ch_out)
+        self.act = nn.Identity() if act is None else get_activation(act) 
+
+
+    def forward(self, x):
+        # 调用 WTConv2d 的 forward 方法
+        x = self.conv.forward(x)
+        x = self.norm(x)  # 批量归一化
+        return self.act(x)  # 激活函数
+    
+    def forward_fuse(self, x):
+        # 调用 WTConv2d 的 forward_fuse 方法
+        x = self.conv.forward_fuse(x)
+        return self.act(x)  # 激活函数
+
+class MFFF(nn.Module): 
+    def __init__(self, dim, e=0.25):
+        super().__init__()
+        self.e = e
+        self.cv1 = Conv(dim, dim, 1)
+        self.cv2 = Conv(dim, dim, 1)
+        self.m = ImprovedFFTKernel(int(dim * self.e))
+
+    def forward(self, x):
+        c1 = round(x.size(1) * self.e)
+        c2 = x.size(1) - c1
+        ok_branch, identity = torch.split(self.cv1(x), [c1, c2], dim=1)
+        return self.cv2(torch.cat((self.m(ok_branch), identity), 1))
+
+class FrequencyFocusedDownSampling(nn.Module):  # Downsample x2分支 with parallel FGM
+    def __init__(self, c1, c2):  
+        super().__init__()
+        self.c = c2 // 2
+        self.cv1 = Conv(c1 // 2, self.c, 3, 2, 1)
+        self.cv2 = Conv(c1 // 2, self.c, 1, 1, 0)
+        self.ffm = FFM(self.c)  # FGM 模块处理 x2 分支
+
+        # 1x1 卷积用于在拼接后减少通道数
+        self.conv_reduce = Conv(self.c * 2, self.c, 1, 1)
+
+        # 新增的卷积层用于调整 fgm_out 的空间尺寸
+        self.conv_resize = Conv(self.c, self.c, 3, 2, 1)
+#经过池化后分成两个分支，一个分支经过 cv1 处理，另一个分支经过 fgm + maxpool cv2 处理，然后将两个分支拼接在一起，最后使用 1x1 卷积将通道数减少到预期的值。公式写一个表达一下，x1,x2用文字描述一下是什么，cv1,cv2也是呀
+    def forward(self, x):
+        x = torch.nn.functional.avg_pool2d(x, 2, 1, 0, False, True)
+        x1, x2 = x.chunk(2, 1)
+        x1 = self.cv1(x1)
+
+        # 并联处理 x2 分支
+        fgm_out = self.ffm(x2)  # FGM 处理的输出
+        fgm_out = self.conv_resize(fgm_out)  # 调整 fgm_out 的空间尺寸
+        pooled_out = torch.nn.functional.max_pool2d(x2, 3, 2, 1)
+        pooled_out = self.cv2(pooled_out)
+
+        # 将 FGM 输出和 MaxPool2d + Conv 输出拼接
+        x2 = torch.cat((fgm_out, pooled_out), 1)
+        
+        # 使用 1x1 卷积将通道数减少到预期的值
+        x2 = self.conv_reduce(x2)
+
+        return torch.cat((x1, x2), 1)
+    
+class SemanticAlignmenCalibration(nn.Module):  # 新的模块名称，更具描述性
+    def __init__(self, inc):
+        super(SemanticAlignmenCalibration, self).__init__()
+        hidden_channels = inc[0]
+
+        self.groups = 2
+        self.spatial_conv = Conv(inc[0], hidden_channels, 3)  # 用于处理高分辨率的空间特征
+        self.semantic_conv = Conv(inc[1], hidden_channels, 3)  # 用于处理低分辨率的语义特征
+
+        # FGM模块：用于在频域中增强特征
+        self.frequency_enhancer = FFM(hidden_channels)
+        # 门控卷积：结合空间和频域特征
+        self.gating_conv = nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1, padding=0, bias=True)
+        
+        # 用于生成偏移量的卷积序列
+        self.offset_conv = nn.Sequential(
+            Conv(hidden_channels * 2, 64),  # 处理拼接后的特征
+            nn.Conv2d(64, self.groups * 4 + 2, kernel_size=3, padding=1, bias=False)  # 生成偏移量
+        )
+
+        self.init_weights()
+        self.offset_conv[1].weight.data.zero_()  # 初始化最后一层卷积的权重为零
+
+    def init_weights(self):
+        # 初始化卷积层的权重
+        for layer in self.children():
+            if isinstance(layer, (nn.Conv2d, nn.Conv1d)):
+                nn.init.xavier_normal_(layer.weight)
+                if layer.bias is not None:
+                    nn.init.constant_(layer.bias, 0)
+
+    def forward(self, x):
+        coarse_features, semantic_features = x
+        batch_size, _, out_h, out_w = coarse_features.size()
+
+        # 处理低分辨率的语义特征 (1/8 下采样)
+        semantic_features = self.semantic_conv(semantic_features)
+        semantic_features = F.interpolate(semantic_features, coarse_features.size()[2:], mode='bilinear', align_corners=True)
+
+        # 频域增强特征
+        enhanced_frequency = self.frequency_enhancer(semantic_features)
+        
+        # 门控机制融合频域和空间域的特征
+        gate = torch.sigmoid(self.gating_conv(semantic_features))
+        fused_features = semantic_features * (1 - gate) + enhanced_frequency * gate
+
+        # 处理高分辨率的空间特征 (1/8 下采样)
+        coarse_features = self.spatial_conv(coarse_features)
+
+        # 拼接处理后的空间特征和融合后的特征
+        conv_results = self.offset_conv(torch.cat([coarse_features, fused_features], 1))
+
+        # 调整特征维度以适应分组
+        fused_features = fused_features.reshape(batch_size * self.groups, -1, out_h, out_w)
+        coarse_features = coarse_features.reshape(batch_size * self.groups, -1, out_h, out_w)
+
+        # 获取偏移量
+        offset_low = conv_results[:, 0:self.groups * 2, :, :].reshape(batch_size * self.groups, -1, out_h, out_w)
+        offset_high = conv_results[:, self.groups * 2:self.groups * 4, :, :].reshape(batch_size * self.groups, -1, out_h, out_w)
+
+        # 生成归一化网格用于偏移校正
+        normalization_factors = torch.tensor([[[[out_w, out_h]]]]).type_as(fused_features).to(fused_features.device)
+        grid_w = torch.linspace(-1.0, 1.0, out_h).view(-1, 1).repeat(1, out_w)
+        grid_h = torch.linspace(-1.0, 1.0, out_w).repeat(out_h, 1)
+        base_grid = torch.cat((grid_h.unsqueeze(2), grid_w.unsqueeze(2)), 2)
+        base_grid = base_grid.repeat(batch_size * self.groups, 1, 1, 1).type_as(fused_features).to(fused_features.device)
+
+        # 使用生成的偏移量对网格进行调整
+        adjusted_grid_l = base_grid + offset_low.permute(0, 2, 3, 1) / normalization_factors
+        adjusted_grid_h = base_grid + offset_high.permute(0, 2, 3, 1) / normalization_factors
+
+        # 进行特征采样
+        coarse_features = F.grid_sample(coarse_features, adjusted_grid_l, align_corners=True)
+        fused_features = F.grid_sample(fused_features, adjusted_grid_h, align_corners=True)
+
+        # 调整维度回到原始形状
+        coarse_features = coarse_features.reshape(batch_size, -1, out_h, out_w)
+        fused_features = fused_features.reshape(batch_size, -1, out_h, out_w)
+
+        # 融合增强后的特征
+        attention_weights = 1 + torch.tanh(conv_results[:, self.groups * 4:, :, :])
+        final_features = fused_features * attention_weights[:, 0:1, :, :] + coarse_features * attention_weights[:, 1:2, :, :]
+
+        return final_features
 
 
 class ResNetLayer(nn.Module):
