@@ -9,61 +9,67 @@ from pathlib import Path
 
 import thop
 import torch
+import torch.nn as nn
 
-from ultralytics.nn.modules import (
-    AIFI,
-    C1,
-    C2,
-    C2PSA,
-    C3,
-    C3TR,
-    ELAN1,
-    OBB,
-    PSA,
-    SPP,
-    SPPELAN,
-    SPPF,
-    AConv,
-    ADown,
-    Bottleneck,
-    BottleneckCSP,
-    C2f,
-    C2fAttn,
-    C2fCIB,
-    C2fPSA,
-    C3Ghost,
-    C3k2,
-    C3x,
-    CBFuse,
-    CBLinear,
-    Classify,
-    Concat,
-    Conv,
-    Conv2,
-    ConvTranspose,
-    Detect,
-    DWConv,
-    DWConvTranspose2d,
-    Focus,
-    GhostBottleneck,
-    GhostConv,
-    HGBlock,
-    HGStem,
-    ImagePoolingAttn,
-    Index,
-    Pose,
-    RepC3,
-    RepConv,
-    RepNCSPELAN4,
-    RepVGGDW,
-    ResNetLayer,
-    RTDETRDecoder,
-    SCDown,
-    Segment,
-    TorchVision,
-    WorldDetect,
-    v10Detect,
-)
+#from ultralytics.nn.modules import WorldDetect
+
+# from ultralytics.nn.modules import (
+#     AIFI,
+#     C1,
+#     C2,
+#     C2PSA,
+#     C3,
+#     C3TR,
+#     ELAN1,
+#     OBB,
+#     PSA,
+#     SPP,
+#     SPPELAN,
+#     SPPF,
+#     AConv,
+#     ADown,
+#     Bottleneck,
+#     BottleneckCSP,
+#     C2f,
+#     C2fAttn,
+#     C2fCIB,
+#     C2fPSA,
+#     C3Ghost,
+#     C3k2,
+#     C3x,
+#     CBFuse,
+#     CBLinear,
+#     Classify,
+#     Concat,
+#     Conv,
+#     Conv2,
+#     ConvTranspose,
+#     Detect,
+#     DWConv,
+#     DWConvTranspose2d,
+#     Focus,
+#     GhostBottleneck,
+#     GhostConv,
+#     HGBlock,
+#     HGStem,
+#     ImagePoolingAttn,
+#     Index,
+#     Pose,
+#     RepC3,
+#     RepConv,
+#     RepNCSPELAN4,
+#     RepVGGDW,
+#     ResNetLayer,
+#     RTDETRDecoder,
+#     SCDown,
+#     Segment,
+#     TorchVision,
+#     WorldDetect,
+#     v10Detect,
+# )
+
+from ultralytics.nn.modules import *
+from ultralytics.nn.uav_modules import *
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
 from ultralytics.utils.loss import (
@@ -211,6 +217,10 @@ class BaseModel(torch.nn.Module):
                 if isinstance(m, RepVGGDW):
                     m.fuse()
                     m.forward = m.forward_fuse
+                if isinstance(m, ConvNormLayer):
+                    m.conv = fuse_conv_and_bn(m.conv, m.norm)  # update conv
+                    delattr(m, 'norm')  # remove batchnorm
+                    m.forward = m.forward_fuse  # update forward
             self.info(verbose=verbose)
 
         return self
@@ -644,8 +654,8 @@ class WorldModel(DetectionModel):
                 self._profile_one_layer(m, x, dt)
             if isinstance(m, C2fAttn):
                 x = m(x, txt_feats)
-            elif isinstance(m, WorldDetect):
-                x = m(x, ori_txt_feats)
+            # elif isinstance(m, WorldDetect):
+            #     x = m(x, ori_txt_feats)
             elif isinstance(m, ImagePoolingAttn):
                 txt_feats = m(x, txt_feats)
             else:
@@ -945,9 +955,113 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
     if verbose:
         LOGGER.info(f"\n{'':>3}{'from':>20}{'n':>3}{'params':>10}  {'module':<45}{'arguments':<30}")
     ch = [ch]
+    is_backbone = False
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
-    base_modules = frozenset(
-        {
+    # base_modules = frozenset(
+    #     {
+    #         Classify,
+    #         Conv,
+    #         ConvTranspose,
+    #         GhostConv,
+    #         Bottleneck,
+    #         GhostBottleneck,
+    #         SPP,
+    #         SPPF,
+    #         C2fPSA,
+    #         C2PSA,
+    #         DWConv,
+    #         Focus,
+    #         BottleneckCSP,
+    #         C1,
+    #         C2,
+    #         C2f,
+    #         C3k2,
+    #         RepNCSPELAN4,
+    #         ELAN1,
+    #         ADown,
+    #         AConv,
+    #         SPPELAN,
+    #         C2fAttn,
+    #         C3,
+    #         C3TR,
+    #         C3Ghost,
+    #         nn.ConvTranspose2d,
+    #         DWConvTranspose2d,
+    #         C3x,
+    #         RepC3,
+    #         PSA,
+    #         SCDown,
+    #         C2fCIB,
+    #         ConvNormLayer,
+    #     }
+    # )
+    # repeat_modules = frozenset(  # modules with 'repeat' arguments
+    #     {
+    #         BottleneckCSP,
+    #         C1,
+    #         C2,
+    #         C2f,
+    #         C3k2,
+    #         C2fAttn,
+    #         C3,
+    #         C3TR,
+    #         C3Ghost,
+    #         C3x,
+    #         RepC3,
+    #         C2fPSA,
+    #         C2fCIB,
+    #         C2PSA,
+    #     }
+    # )
+    # for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
+    #     m = (
+    #         getattr(torch.nn, m[3:])
+    #         if "nn." in m
+    #         else getattr(__import__("torchvision").ops, m[16:])
+    #         if "torchvision.ops." in m
+    #         else globals()[m]
+    #     )  # get module
+    #     for j, a in enumerate(args):
+    #         if isinstance(a, str):
+    #             with contextlib.suppress(ValueError):
+    #                 args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
+    #     n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
+    #     # if m in base_modules:
+    #     if m in {
+    #         Classify,
+    #         Conv,
+    #         ConvTranspose,
+    #         GhostConv,
+    #         Bottleneck,
+    #         GhostBottleneck,
+    #         SPP,
+    #         SPPF,
+    #         DWConv,
+    #         Focus,
+    #         BottleneckCSP,
+    #         C1,
+    #         C2,
+    #         C2f,
+    #         FrequencyFocusedDownSampling,
+    #         C3,
+    #         C3TR,
+    #         C3Ghost,
+    #         nn.ConvTranspose2d,
+    #         DWConvTranspose2d,
+    #         C3x,
+    #         RepC3,
+    #         SPDConv,
+    #         ConvNormLayer,
+    #     }:
+    for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
+        m = getattr(torch.nn, m[3:]) if "nn." in m else globals()[m]  # get module
+        for j, a in enumerate(args):
+            if isinstance(a, str):
+                with contextlib.suppress(ValueError):
+                    args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
+
+        n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
+        if m in {
             Classify,
             Conv,
             ConvTranspose,
@@ -956,82 +1070,58 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             GhostBottleneck,
             SPP,
             SPPF,
-            C2fPSA,
-            C2PSA,
             DWConv,
             Focus,
             BottleneckCSP,
             C1,
             C2,
             C2f,
-            C3k2,
-            RepNCSPELAN4,
-            ELAN1,
-            ADown,
-            AConv,
-            SPPELAN,
-            C2fAttn,
+            FrequencyFocusedDownSampling,
             C3,
             C3TR,
             C3Ghost,
-            torch.nn.ConvTranspose2d,
+            nn.ConvTranspose2d,
             DWConvTranspose2d,
             C3x,
             RepC3,
-            PSA,
-            SCDown,
-            C2fCIB,
-        }
-    )
-    repeat_modules = frozenset(  # modules with 'repeat' arguments
-        {
-            BottleneckCSP,
-            C1,
-            C2,
-            C2f,
-            C3k2,
-            C2fAttn,
-            C3,
-            C3TR,
-            C3Ghost,
-            C3x,
-            RepC3,
-            C2fPSA,
-            C2fCIB,
-            C2PSA,
-        }
-    )
-    for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
-        m = (
-            getattr(torch.nn, m[3:])
-            if "nn." in m
-            else getattr(__import__("torchvision").ops, m[16:])
-            if "torchvision.ops." in m
-            else globals()[m]
-        )  # get module
-        for j, a in enumerate(args):
-            if isinstance(a, str):
-                with contextlib.suppress(ValueError):
-                    args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
-        n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
-        if m in base_modules:
+            SPDConv,
+            ConvNormLayer,
+        }:
             c1, c2 = ch[f], args[0]
             if c2 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
                 c2 = make_divisible(min(c2, max_channels) * width, 8)
-            if m is C2fAttn:  # set 1) embed channels and 2) num heads
-                args[1] = make_divisible(min(args[1], max_channels // 2) * width, 8)
-                args[2] = int(max(round(min(args[2], max_channels // 2 // 32)) * width, 1) if args[2] > 1 else args[2])
+            # if m is C2fAttn:  # set 1) embed channels and 2) num heads
+            #     args[1] = make_divisible(min(args[1], max_channels // 2) * width, 8)
+            #     args[2] = int(max(round(min(args[2], max_channels // 2 // 32)) * width, 1) if args[2] > 1 else args[2])
 
+            # args = [c1, c2, *args[1:]]
+            # if m in repeat_modules:
+            #     args.insert(2, n)  # number of repeats
+            #     n = 1
+            # if m is C3k2:  # for M/L/X sizes
+            #     legacy = False
+            #     if scale in "mlx":
+            #         args[3] = True
             args = [c1, c2, *args[1:]]
-            if m in repeat_modules:
+            if m in {
+                BottleneckCSP,
+                C1,
+                C2,
+                C2f,
+                C3,
+                C3TR,
+                C3Ghost,
+                C3x,
+                RepC3,
+            }:
                 args.insert(2, n)  # number of repeats
                 n = 1
-            if m is C3k2:  # for M/L/X sizes
-                legacy = False
-                if scale in "mlx":
-                    args[3] = True
         elif m is AIFI:
             args = [ch[f], *args]
+        elif m is SemanticAlignmenCalibration:
+            c1 = [ch[x] for x in f]
+            c2 = c1[0]
+            args = [c1]
         elif m in frozenset({HGStem, HGBlock}):
             c1, cm, c2 = ch[f], args[0], args[1]
             args = [c1, cm, c2, *args[2:]]
@@ -1044,7 +1134,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
-        elif m in frozenset({Detect, WorldDetect, Segment, Pose, OBB, ImagePoolingAttn, v10Detect}):
+        elif m in frozenset({Detect, Segment, Pose, OBB, ImagePoolingAttn, v10Detect}):
             args.append([ch[x] for x in f])
             if m is Segment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
@@ -1062,16 +1152,45 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             c2 = args[0]
             c1 = ch[f]
             args = [*args[1:]]
+        elif m in { DySample }:
+            c2 = ch[f]
+            args = [c2, *args]
+        elif m in {MFFF}:
+            c2 = ch[f]
+            args = [c2]
+        elif m is nn.BatchNorm2d:
+            args = [ch[f]]
+        elif m is Concat:
+            c2 = sum(ch[x] for x in f)
+        elif m is Blocks:
+            block_type = globals()[args[1]]
+            c1, c2 = ch[f], args[0] * block_type.expansion
+            args = [c1, args[0], block_type, *args[2:]]
+        elif m in {Detect,  Segment, Pose}:
+            args.append([ch[x] for x in f])
+            if m is Segment:
+                args[2] = make_divisible(min(args[2], max_channels) * width, 8)
+        elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
+            args.insert(1, [ch[x] for x in f])
         else:
             c2 = ch[f]
 
-        m_ = torch.nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
-        t = str(m)[8:-2].replace("__main__.", "")  # module type
+        # m_ = torch.nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
+        # t = str(m)[8:-2].replace("__main__.", "")  # module type
+        if isinstance(c2, list) and m not in {}:
+            is_backbone = True
+            m_ = m
+            m_.backbone = True
+        else:
+            m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
+            t = str(m)[8:-2].replace('__main__.', '')  # module type
         m_.np = sum(x.numel() for x in m_.parameters())  # number params
-        m_.i, m_.f, m_.type = i, f, t  # attach index, 'from' index, type
+        # m_.i, m_.f, m_.type = i, f, t  # attach index, 'from' index, type
+        m_.i, m_.f, m_.type = i + 4 if is_backbone else i, f, t  # attach index, 'from' index, type
         if verbose:
             LOGGER.info(f"{i:>3}{str(f):>20}{n_:>3}{m_.np:10.0f}  {t:<45}{str(args):<30}")  # print
-        save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
+        # save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
+        save.extend(x % (i + 4 if is_backbone else i) for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
         layers.append(m_)
         if i == 0:
             ch = []
@@ -1162,8 +1281,8 @@ def guess_model_task(model):
                 return "pose"
             elif isinstance(m, OBB):
                 return "obb"
-            elif isinstance(m, (Detect, WorldDetect, v10Detect)):
-                return "detect"
+            # elif isinstance(m, (Detect, WorldDetect, v10Detect)):
+            #     return "detect"
 
     # Guess from model filename
     if isinstance(model, (str, Path)):

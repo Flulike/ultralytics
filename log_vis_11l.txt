@@ -1,0 +1,16 @@
+Traceback (most recent call last):
+  File "/home/guo/ultralytics/train_yolo.py", line 6, in <module>
+    model = YOLO("yolo8x.yaml")  # build a new model from YAML
+  File "/home/guo/ultralytics/ultralytics/models/yolo/model.py", line 23, in __init__
+    super().__init__(model=model, task=task, verbose=verbose)
+  File "/home/guo/ultralytics/ultralytics/engine/model.py", line 146, in __init__
+    self._new(model, task=task, verbose=verbose)
+  File "/home/guo/ultralytics/ultralytics/engine/model.py", line 254, in _new
+    cfg_dict = yaml_model_load(cfg)
+  File "/home/guo/ultralytics/ultralytics/nn/tasks.py", line 1091, in yaml_model_load
+    yaml_file = check_yaml(unified_path, hard=False) or check_yaml(path)
+  File "/home/guo/ultralytics/ultralytics/utils/checks.py", line 530, in check_yaml
+    return check_file(file, suffix, hard=hard)
+  File "/home/guo/ultralytics/ultralytics/utils/checks.py", line 522, in check_file
+    raise FileNotFoundError(f"'{file}' does not exist")
+FileNotFoundError: 'yolo8x.yaml' does not exist
