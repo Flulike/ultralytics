@@ -119,13 +119,18 @@ class FFM(nn.Module):
         x1 = self.dwconv1(x)
         x2 = self.dwconv2(x)
 
+        # 原本的
         # x2_fft = torch.fft.fft2(x2, norm='backward')
         x2_fft = torch.fft.fft2(x2.to(torch.complex64), norm='backward')
 
-        out = x1 * x2_fft
+        # 原本的
+        # out = x1 * x2_fft
+        out = x1.to(torch.complex64) * x2_fft
 
         out = torch.fft.ifft2(out, dim=(-2,-1), norm='backward')
-        out = torch.abs(out)
+        # 原本的
+        #out = torch.abs(out)
+        out = torch.abs(out).to(x.dtype)
 
         return out * self.alpha + x * self.beta
 
@@ -167,13 +172,20 @@ class ImprovedFFTKernel(nn.Module):
     def forward(self, x):
         out = self.in_conv(x)
 
-        # fca 部分
-        x_att = self.fac_conv(self.fac_pool(out))
+        # fca 部分 # 原本的
+        # x_att = self.fac_conv(self.fac_pool(out))
         # x_fft = torch.fft.fft2(out, norm='backward')
+        # x_fft = x_att * x_fft
+        # x_fca = torch.fft.ifft2(x_fft, dim=(-2, -1), norm='backward')
+        # x_fca = torch.abs(x_fca)
+
+        # 更改
+        x_att = self.fac_conv(self.fac_pool(out))
         x_fft = torch.fft.fft2(out.to(torch.complex64), norm='backward')
-        x_fft = x_att * x_fft
+        x_fft = x_att.to(torch.complex64) * x_fft
         x_fca = torch.fft.ifft2(x_fft, dim=(-2, -1), norm='backward')
-        x_fca = torch.abs(x_fca)
+        x_fca = torch.abs(x_fca).to(out.dtype)
+
 
         # sca 部分
         x_sca1 = self.conv1x1(x_fca)

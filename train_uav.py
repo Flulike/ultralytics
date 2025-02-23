@@ -23,10 +23,10 @@ if __name__ == '__main__':
     model.train(data=str(yaml_path),
                 cache=False,
                 imgsz=640,
-                epochs=36,
+                epochs=350,
                 batch=4,
                 workers=8,
-                device='3',
+                device=2,
                 # resume='', # last.pt path
                 project='/home/guo/ultralytics/results/ultralytics/uavdetr',
                 name='exp',

@@ -6,10 +6,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from collections import OrderedDict
 
-# from ultralytics.utils.torch_utils import fuse_conv_and_bn
+from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
 # from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
-from .conv import Conv, DWConv, GhostConv, LightConv, RepConv
+from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
 from .transformer import TransformerBlock
 
 __all__ = (
@@ -39,8 +39,6 @@ __all__ = (
     'BasicBlock',
     'BottleNeck',
     'Blocks',
-    'FrequencyFocusedDownSampling',
-    'SemanticAlignmenCalibration',
     "ResNetLayer",
     "RepNCSPELAN4",
     "ELAN1",
@@ -806,138 +804,6 @@ class WTConvNormLayer(nn.Module):
         # 调用 WTConv2d 的 forward_fuse 方法
         x = self.conv.forward_fuse(x)
         return self.act(x)  # 激活函数
-
-class MFFF(nn.Module): 
-    def __init__(self, dim, e=0.25):
-        super().__init__()
-        self.e = e
-        self.cv1 = Conv(dim, dim, 1)
-        self.cv2 = Conv(dim, dim, 1)
-        self.m = ImprovedFFTKernel(int(dim * self.e))
-
-    def forward(self, x):
-        c1 = round(x.size(1) * self.e)
-        c2 = x.size(1) - c1
-        ok_branch, identity = torch.split(self.cv1(x), [c1, c2], dim=1)
-        return self.cv2(torch.cat((self.m(ok_branch), identity), 1))
-
-class FrequencyFocusedDownSampling(nn.Module):  # Downsample x2分支 with parallel FGM
-    def __init__(self, c1, c2):  
-        super().__init__()
-        self.c = c2 // 2
-        self.cv1 = Conv(c1 // 2, self.c, 3, 2, 1)
-        self.cv2 = Conv(c1 // 2, self.c, 1, 1, 0)
-        self.ffm = FFM(self.c)  # FGM 模块处理 x2 分支
-
-        # 1x1 卷积用于在拼接后减少通道数
-        self.conv_reduce = Conv(self.c * 2, self.c, 1, 1)
-
-        # 新增的卷积层用于调整 fgm_out 的空间尺寸
-        self.conv_resize = Conv(self.c, self.c, 3, 2, 1)
-#经过池化后分成两个分支，一个分支经过 cv1 处理，另一个分支经过 fgm + maxpool cv2 处理，然后将两个分支拼接在一起，最后使用 1x1 卷积将通道数减少到预期的值。公式写一个表达一下，x1,x2用文字描述一下是什么，cv1,cv2也是呀
-    def forward(self, x):
-        x = torch.nn.functional.avg_pool2d(x, 2, 1, 0, False, True)
-        x1, x2 = x.chunk(2, 1)
-        x1 = self.cv1(x1)
-
-        # 并联处理 x2 分支
-        fgm_out = self.ffm(x2)  # FGM 处理的输出
-        fgm_out = self.conv_resize(fgm_out)  # 调整 fgm_out 的空间尺寸
-        pooled_out = torch.nn.functional.max_pool2d(x2, 3, 2, 1)
-        pooled_out = self.cv2(pooled_out)
-
-        # 将 FGM 输出和 MaxPool2d + Conv 输出拼接
-        x2 = torch.cat((fgm_out, pooled_out), 1)
-        
-        # 使用 1x1 卷积将通道数减少到预期的值
-        x2 = self.conv_reduce(x2)
-
-        return torch.cat((x1, x2), 1)
-    
-class SemanticAlignmenCalibration(nn.Module):  # 新的模块名称，更具描述性
-    def __init__(self, inc):
-        super(SemanticAlignmenCalibration, self).__init__()
-        hidden_channels = inc[0]
-
-        self.groups = 2
-        self.spatial_conv = Conv(inc[0], hidden_channels, 3)  # 用于处理高分辨率的空间特征
-        self.semantic_conv = Conv(inc[1], hidden_channels, 3)  # 用于处理低分辨率的语义特征
-
-        # FGM模块：用于在频域中增强特征
-        self.frequency_enhancer = FFM(hidden_channels)
-        # 门控卷积：结合空间和频域特征
-        self.gating_conv = nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1, padding=0, bias=True)
-        
-        # 用于生成偏移量的卷积序列
-        self.offset_conv = nn.Sequential(
-            Conv(hidden_channels * 2, 64),  # 处理拼接后的特征
-            nn.Conv2d(64, self.groups * 4 + 2, kernel_size=3, padding=1, bias=False)  # 生成偏移量
-        )
-
-        self.init_weights()
-        self.offset_conv[1].weight.data.zero_()  # 初始化最后一层卷积的权重为零
-
-    def init_weights(self):
-        # 初始化卷积层的权重
-        for layer in self.children():
-            if isinstance(layer, (nn.Conv2d, nn.Conv1d)):
-                nn.init.xavier_normal_(layer.weight)
-                if layer.bias is not None:
-                    nn.init.constant_(layer.bias, 0)
-
-    def forward(self, x):
-        coarse_features, semantic_features = x
-        batch_size, _, out_h, out_w = coarse_features.size()
-
-        # 处理低分辨率的语义特征 (1/8 下采样)
-        semantic_features = self.semantic_conv(semantic_features)
-        semantic_features = F.interpolate(semantic_features, coarse_features.size()[2:], mode='bilinear', align_corners=True)
-
-        # 频域增强特征
-        enhanced_frequency = self.frequency_enhancer(semantic_features)
-        
-        # 门控机制融合频域和空间域的特征
-        gate = torch.sigmoid(self.gating_conv(semantic_features))
-        fused_features = semantic_features * (1 - gate) + enhanced_frequency * gate
-
-        # 处理高分辨率的空间特征 (1/8 下采样)
-        coarse_features = self.spatial_conv(coarse_features)
-
-        # 拼接处理后的空间特征和融合后的特征
-        conv_results = self.offset_conv(torch.cat([coarse_features, fused_features], 1))
-
-        # 调整特征维度以适应分组
-        fused_features = fused_features.reshape(batch_size * self.groups, -1, out_h, out_w)
-        coarse_features = coarse_features.reshape(batch_size * self.groups, -1, out_h, out_w)
-
-        # 获取偏移量
-        offset_low = conv_results[:, 0:self.groups * 2, :, :].reshape(batch_size * self.groups, -1, out_h, out_w)
-        offset_high = conv_results[:, self.groups * 2:self.groups * 4, :, :].reshape(batch_size * self.groups, -1, out_h, out_w)
-
-        # 生成归一化网格用于偏移校正
-        normalization_factors = torch.tensor([[[[out_w, out_h]]]]).type_as(fused_features).to(fused_features.device)
-        grid_w = torch.linspace(-1.0, 1.0, out_h).view(-1, 1).repeat(1, out_w)
-        grid_h = torch.linspace(-1.0, 1.0, out_w).repeat(out_h, 1)
-        base_grid = torch.cat((grid_h.unsqueeze(2), grid_w.unsqueeze(2)), 2)
-        base_grid = base_grid.repeat(batch_size * self.groups, 1, 1, 1).type_as(fused_features).to(fused_features.device)
-
-        # 使用生成的偏移量对网格进行调整
-        adjusted_grid_l = base_grid + offset_low.permute(0, 2, 3, 1) / normalization_factors
-        adjusted_grid_h = base_grid + offset_high.permute(0, 2, 3, 1) / normalization_factors
-
-        # 进行特征采样
-        coarse_features = F.grid_sample(coarse_features, adjusted_grid_l, align_corners=True)
-        fused_features = F.grid_sample(fused_features, adjusted_grid_h, align_corners=True)
-
-        # 调整维度回到原始形状
-        coarse_features = coarse_features.reshape(batch_size, -1, out_h, out_w)
-        fused_features = fused_features.reshape(batch_size, -1, out_h, out_w)
-
-        # 融合增强后的特征
-        attention_weights = 1 + torch.tanh(conv_results[:, self.groups * 4:, :, :])
-        final_features = fused_features * attention_weights[:, 0:1, :, :] + coarse_features * attention_weights[:, 1:2, :, :]
-
-        return final_features
 
 
 class ResNetLayer(nn.Module):
