@@ -173,4 +173,7 @@ pnnx*
 
 # calibration image
 calibration_*.npy
+
+# large files
+/home/guo/ultralytics/log_uav_drone.txt
 log_detr_drone.txt
