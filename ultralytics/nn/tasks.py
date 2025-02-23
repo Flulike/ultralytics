@@ -212,6 +212,10 @@ class BaseModel(nn.Module):
                 if isinstance(m, RepConv):
                     m.fuse_convs()
                     m.forward = m.forward_fuse  # update forward
+                if isinstance(m, ConvNormLayer):
+                    m.conv = fuse_conv_and_bn(m.conv, m.norm)  # update conv
+                    delattr(m, 'norm')  # remove batchnorm
+                    m.forward = m.forward_fuse  # update forward
                 if isinstance(m, RepVGGDW):
                     m.fuse()
                     m.forward = m.forward_fuse
@@ -1085,6 +1089,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             ch = []
         ch.append(c2)
     return nn.Sequential(*layers), sorted(save)
+
 
 
 def yaml_model_load(path):
