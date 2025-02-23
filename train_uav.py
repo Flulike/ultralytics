@@ -26,7 +26,7 @@ if __name__ == '__main__':
                 epochs=350,
                 batch=4,
                 workers=8,
-                device=2,
+                device=3,
                 # resume='', # last.pt path
                 project='/home/guo/ultralytics/results/ultralytics/uavdetr',
                 name='exp',
