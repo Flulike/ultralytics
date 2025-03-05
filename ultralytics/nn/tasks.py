@@ -11,60 +11,65 @@ import thop
 import torch
 import torch.nn as nn
 
-from ultralytics.nn.modules import (
-    AIFI,
-    C1,
-    C2,
-    C2PSA,
-    C3,
-    C3TR,
-    ELAN1,
-    OBB,
-    PSA,
-    SPP,
-    SPPELAN,
-    SPPF,
-    AConv,
-    ADown,
-    Bottleneck,
-    BottleneckCSP,
-    C2f,
-    C2fAttn,
-    C2fCIB,
-    C2fPSA,
-    C3Ghost,
-    C3k2,
-    C3x,
-    CBFuse,
-    CBLinear,
-    Classify,
-    Concat,
-    Conv,
-    Conv2,
-    ConvTranspose,
-    Detect,
-    DWConv,
-    DWConvTranspose2d,
-    Focus,
-    GhostBottleneck,
-    GhostConv,
-    HGBlock,
-    HGStem,
-    ImagePoolingAttn,
-    Index,
-    Pose,
-    RepC3,
-    RepConv,
-    RepNCSPELAN4,
-    RepVGGDW,
-    ResNetLayer,
-    RTDETRDecoder,
-    SCDown,
-    Segment,
-    TorchVision,
-    WorldDetect,
-    v10Detect,
-)
+#from ultralytics.nn.modules import WorldDetect
+
+# from ultralytics.nn.modules import (
+#     AIFI,
+#     C1,
+#     C2,
+#     C2PSA,
+#     C3,
+#     C3TR,
+#     ELAN1,
+#     OBB,
+#     PSA,
+#     SPP,
+#     SPPELAN,
+#     SPPF,
+#     AConv,
+#     ADown,
+#     Bottleneck,
+#     BottleneckCSP,
+#     C2f,
+#     C2fAttn,
+#     C2fCIB,
+#     C2fPSA,
+#     C3Ghost,
+#     C3k2,
+#     C3x,
+#     CBFuse,
+#     CBLinear,
+#     Classify,
+#     Concat,
+#     Conv,
+#     Conv2,
+#     ConvTranspose,
+#     Detect,
+#     DWConv,
+#     DWConvTranspose2d,
+#     Focus,
+#     GhostBottleneck,
+#     GhostConv,
+#     HGBlock,
+#     HGStem,
+#     ImagePoolingAttn,
+#     Index,
+#     Pose,
+#     RepC3,
+#     RepConv,
+#     RepNCSPELAN4,
+#     RepVGGDW,
+#     ResNetLayer,
+#     RTDETRDecoder,
+#     SCDown,
+#     Segment,
+#     TorchVision,
+#     WorldDetect,
+#     v10Detect,
+# )
+
+from ultralytics.nn.modules import *
+from ultralytics.nn.uav_modules import *
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
 from ultralytics.utils.loss import (
@@ -88,7 +93,7 @@ from ultralytics.utils.torch_utils import (
 )
 
 
-class BaseModel(nn.Module):
+class BaseModel(torch.nn.Module):
     """The BaseModel class serves as a base class for all the models in the Ultralytics YOLO family."""
 
     def forward(self, x, *args, **kwargs):
@@ -151,7 +156,7 @@ class BaseModel(nn.Module):
             if visualize:
                 feature_visualization(x, m.type, m.i, save_dir=visualize)
             if embed and m.i in embed:
-                embeddings.append(nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
+                embeddings.append(torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
                 if m.i == max(embed):
                     return torch.unbind(torch.cat(embeddings, 1), dim=0)
         return x
@@ -170,12 +175,9 @@ class BaseModel(nn.Module):
         the provided list.
 
         Args:
-            m (nn.Module): The layer to be profiled.
+            m (torch.nn.Module): The layer to be profiled.
             x (torch.Tensor): The input data to the layer.
             dt (list): A list to store the computation time of the layer.
-
-        Returns:
-            None
         """
         c = m == self.model[-1] and isinstance(x, list)  # is final layer list, copy input as inplace fix
         flops = thop.profile(m, inputs=[x.copy() if c else x], verbose=False)[0] / 1e9 * 2 if thop else 0  # GFLOPs
@@ -195,7 +197,7 @@ class BaseModel(nn.Module):
         computation efficiency.
 
         Returns:
-            (nn.Module): The fused model is returned.
+            (torch.nn.Module): The fused model is returned.
         """
         if not self.is_fused():
             for m in self.model.modules():
@@ -219,6 +221,10 @@ class BaseModel(nn.Module):
                 if isinstance(m, RepVGGDW):
                     m.fuse()
                     m.forward = m.forward_fuse
+                if isinstance(m, ConvNormLayer):
+                    m.conv = fuse_conv_and_bn(m.conv, m.norm)  # update conv
+                    delattr(m, 'norm')  # remove batchnorm
+                    m.forward = m.forward_fuse  # update forward
             self.info(verbose=verbose)
 
         return self
@@ -233,7 +239,7 @@ class BaseModel(nn.Module):
         Returns:
             (bool): True if the number of BatchNorm layers in the model is less than the threshold, False otherwise.
         """
-        bn = tuple(v for k, v in nn.__dict__.items() if "Norm" in k)  # normalization layers, i.e. BatchNorm2d()
+        bn = tuple(v for k, v in torch.nn.__dict__.items() if "Norm" in k)  # normalization layers, i.e. BatchNorm2d()
         return sum(isinstance(v, bn) for v in self.modules()) < thresh  # True if < 'thresh' BatchNorm layers in model
 
     def info(self, detailed=False, verbose=True, imgsz=640):
@@ -308,7 +314,7 @@ class DetectionModel(BaseModel):
         self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)  # cfg dict
         if self.yaml["backbone"][0][2] == "Silence":
             LOGGER.warning(
-                "WARNING ⚠️ YOLOv9 `Silence` module is deprecated in favor of nn.Identity. "
+                "WARNING ⚠️ YOLOv9 `Silence` module is deprecated in favor of torch.nn.Identity. "
                 "Please delete local *.pt file and re-download the latest model checkpoint."
             )
             self.yaml["backbone"][0][2] = "nn.Identity"
@@ -462,20 +468,22 @@ class ClassificationModel(BaseModel):
         name, m = list((model.model if hasattr(model, "model") else model).named_children())[-1]  # last module
         if isinstance(m, Classify):  # YOLO Classify() head
             if m.linear.out_features != nc:
-                m.linear = nn.Linear(m.linear.in_features, nc)
-        elif isinstance(m, nn.Linear):  # ResNet, EfficientNet
+                m.linear = torch.nn.Linear(m.linear.in_features, nc)
+        elif isinstance(m, torch.nn.Linear):  # ResNet, EfficientNet
             if m.out_features != nc:
-                setattr(model, name, nn.Linear(m.in_features, nc))
-        elif isinstance(m, nn.Sequential):
+                setattr(model, name, torch.nn.Linear(m.in_features, nc))
+        elif isinstance(m, torch.nn.Sequential):
             types = [type(x) for x in m]
-            if nn.Linear in types:
-                i = len(types) - 1 - types[::-1].index(nn.Linear)  # last nn.Linear index
+            if torch.nn.Linear in types:
+                i = len(types) - 1 - types[::-1].index(torch.nn.Linear)  # last torch.nn.Linear index
                 if m[i].out_features != nc:
-                    m[i] = nn.Linear(m[i].in_features, nc)
-            elif nn.Conv2d in types:
-                i = len(types) - 1 - types[::-1].index(nn.Conv2d)  # last nn.Conv2d index
+                    m[i] = torch.nn.Linear(m[i].in_features, nc)
+            elif torch.nn.Conv2d in types:
+                i = len(types) - 1 - types[::-1].index(torch.nn.Conv2d)  # last torch.nn.Conv2d index
                 if m[i].out_channels != nc:
-                    m[i] = nn.Conv2d(m[i].in_channels, nc, m[i].kernel_size, m[i].stride, bias=m[i].bias is not None)
+                    m[i] = torch.nn.Conv2d(
+                        m[i].in_channels, nc, m[i].kernel_size, m[i].stride, bias=m[i].bias is not None
+                    )
 
     def init_criterion(self):
         """Initialize the loss criterion for the ClassificationModel."""
@@ -489,12 +497,6 @@ class RTDETRDetectionModel(DetectionModel):
     This class is responsible for constructing the RTDETR architecture, defining loss functions, and facilitating both
     the training and inference processes. RTDETR is an object detection and tracking model that extends from the
     DetectionModel base class.
-
-    Attributes:
-        cfg (str): The configuration file path or preset string. Default is 'rtdetr-l.yaml'.
-        ch (int): Number of input channels. Default is 3 (RGB).
-        nc (int, optional): Number of classes for object detection. Default is None.
-        verbose (bool): Specifies if summary statistics are shown during initialization. Default is True.
 
     Methods:
         init_criterion: Initializes the criterion used for loss calculation.
@@ -591,7 +593,7 @@ class RTDETRDetectionModel(DetectionModel):
             if visualize:
                 feature_visualization(x, m.type, m.i, save_dir=visualize)
             if embed and m.i in embed:
-                embeddings.append(nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
+                embeddings.append(torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
                 if m.i == max(embed):
                     return torch.unbind(torch.cat(embeddings, 1), dim=0)
         head = self.model[-1]
@@ -656,8 +658,8 @@ class WorldModel(DetectionModel):
                 self._profile_one_layer(m, x, dt)
             if isinstance(m, C2fAttn):
                 x = m(x, txt_feats)
-            elif isinstance(m, WorldDetect):
-                x = m(x, ori_txt_feats)
+            # elif isinstance(m, WorldDetect):
+            #     x = m(x, ori_txt_feats)
             elif isinstance(m, ImagePoolingAttn):
                 txt_feats = m(x, txt_feats)
             else:
@@ -667,7 +669,7 @@ class WorldModel(DetectionModel):
             if visualize:
                 feature_visualization(x, m.type, m.i, save_dir=visualize)
             if embed and m.i in embed:
-                embeddings.append(nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
+                embeddings.append(torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
                 if m.i == max(embed):
                     return torch.unbind(torch.cat(embeddings, 1), dim=0)
         return x
@@ -688,7 +690,7 @@ class WorldModel(DetectionModel):
         return self.criterion(preds, batch)
 
 
-class Ensemble(nn.ModuleList):
+class Ensemble(torch.nn.ModuleList):
     """Ensemble of models."""
 
     def __init__(self):
@@ -891,7 +893,7 @@ def attempt_load_weights(weights, device=None, inplace=True, fuse=False):
     for m in ensemble.modules():
         if hasattr(m, "inplace"):
             m.inplace = inplace
-        elif isinstance(m, nn.Upsample) and not hasattr(m, "recompute_scale_factor"):
+        elif isinstance(m, torch.nn.Upsample) and not hasattr(m, "recompute_scale_factor"):
             m.recompute_scale_factor = None  # torch 1.11.0 compatibility
 
     # Return model
@@ -926,7 +928,7 @@ def attempt_load_one_weight(weight, device=None, inplace=True, fuse=False):
     for m in model.modules():
         if hasattr(m, "inplace"):
             m.inplace = inplace
-        elif isinstance(m, nn.Upsample) and not hasattr(m, "recompute_scale_factor"):
+        elif isinstance(m, torch.nn.Upsample) and not hasattr(m, "recompute_scale_factor"):
             m.recompute_scale_factor = None  # torch 1.11.0 compatibility
 
     # Return model and ckpt
@@ -950,16 +952,120 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         depth, width, max_channels = scales[scale]
 
     if act:
-        Conv.default_act = eval(act)  # redefine default activation, i.e. Conv.default_act = nn.SiLU()
+        Conv.default_act = eval(act)  # redefine default activation, i.e. Conv.default_act = torch.nn.SiLU()
         if verbose:
             LOGGER.info(f"{colorstr('activation:')} {act}")  # print
 
     if verbose:
         LOGGER.info(f"\n{'':>3}{'from':>20}{'n':>3}{'params':>10}  {'module':<45}{'arguments':<30}")
     ch = [ch]
+    is_backbone = False
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
-    base_modules = frozenset(
-        {
+    # base_modules = frozenset(
+    #     {
+    #         Classify,
+    #         Conv,
+    #         ConvTranspose,
+    #         GhostConv,
+    #         Bottleneck,
+    #         GhostBottleneck,
+    #         SPP,
+    #         SPPF,
+    #         C2fPSA,
+    #         C2PSA,
+    #         DWConv,
+    #         Focus,
+    #         BottleneckCSP,
+    #         C1,
+    #         C2,
+    #         C2f,
+    #         C3k2,
+    #         RepNCSPELAN4,
+    #         ELAN1,
+    #         ADown,
+    #         AConv,
+    #         SPPELAN,
+    #         C2fAttn,
+    #         C3,
+    #         C3TR,
+    #         C3Ghost,
+    #         nn.ConvTranspose2d,
+    #         DWConvTranspose2d,
+    #         C3x,
+    #         RepC3,
+    #         PSA,
+    #         SCDown,
+    #         C2fCIB,
+    #         ConvNormLayer,
+    #     }
+    # )
+    # repeat_modules = frozenset(  # modules with 'repeat' arguments
+    #     {
+    #         BottleneckCSP,
+    #         C1,
+    #         C2,
+    #         C2f,
+    #         C3k2,
+    #         C2fAttn,
+    #         C3,
+    #         C3TR,
+    #         C3Ghost,
+    #         C3x,
+    #         RepC3,
+    #         C2fPSA,
+    #         C2fCIB,
+    #         C2PSA,
+    #     }
+    # )
+    # for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
+    #     m = (
+    #         getattr(torch.nn, m[3:])
+    #         if "nn." in m
+    #         else getattr(__import__("torchvision").ops, m[16:])
+    #         if "torchvision.ops." in m
+    #         else globals()[m]
+    #     )  # get module
+    #     for j, a in enumerate(args):
+    #         if isinstance(a, str):
+    #             with contextlib.suppress(ValueError):
+    #                 args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
+    #     n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
+    #     # if m in base_modules:
+    #     if m in {
+    #         Classify,
+    #         Conv,
+    #         ConvTranspose,
+    #         GhostConv,
+    #         Bottleneck,
+    #         GhostBottleneck,
+    #         SPP,
+    #         SPPF,
+    #         DWConv,
+    #         Focus,
+    #         BottleneckCSP,
+    #         C1,
+    #         C2,
+    #         C2f,
+    #         FrequencyFocusedDownSampling,
+    #         C3,
+    #         C3TR,
+    #         C3Ghost,
+    #         nn.ConvTranspose2d,
+    #         DWConvTranspose2d,
+    #         C3x,
+    #         RepC3,
+    #         SPDConv,
+    #         ConvNormLayer,
+    #     }:
+    for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
+        m = getattr(torch.nn, m[3:]) if "nn." in m else globals()[m]  # get module
+        for j, a in enumerate(args):
+            if isinstance(a, str):
+                with contextlib.suppress(ValueError):
+                    args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
+
+        n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
+        if m in {
             Classify,
             Conv,
             ConvTranspose,
@@ -968,21 +1074,13 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             GhostBottleneck,
             SPP,
             SPPF,
-            C2fPSA,
-            C2PSA,
             DWConv,
             Focus,
             BottleneckCSP,
             C1,
             C2,
             C2f,
-            C3k2,
-            RepNCSPELAN4,
-            ELAN1,
-            ADown,
-            AConv,
-            SPPELAN,
-            C2fAttn,
+            FrequencyFocusedDownSampling,
             C3,
             C3TR,
             C3Ghost,
@@ -990,60 +1088,44 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             DWConvTranspose2d,
             C3x,
             RepC3,
-            PSA,
-            SCDown,
-            C2fCIB,
-        }
-    )
-    repeat_modules = frozenset(  # modules with 'repeat' arguments
-        {
-            BottleneckCSP,
-            C1,
-            C2,
-            C2f,
-            C3k2,
-            C2fAttn,
-            C3,
-            C3TR,
-            C3Ghost,
-            C3x,
-            RepC3,
-            C2fPSA,
-            C2fCIB,
-            C2PSA,
-        }
-    )
-    for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
-        m = (
-            getattr(torch.nn, m[3:])
-            if "nn." in m
-            else getattr(__import__("torchvision").ops, m[16:])
-            if "torchvision.ops." in m
-            else globals()[m]
-        )  # get module
-        for j, a in enumerate(args):
-            if isinstance(a, str):
-                with contextlib.suppress(ValueError):
-                    args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
-        n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
-        if m in base_modules:
+            SPDConv,
+            ConvNormLayer,
+        }:
             c1, c2 = ch[f], args[0]
             if c2 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
                 c2 = make_divisible(min(c2, max_channels) * width, 8)
-            if m is C2fAttn:  # set 1) embed channels and 2) num heads
-                args[1] = make_divisible(min(args[1], max_channels // 2) * width, 8)
-                args[2] = int(max(round(min(args[2], max_channels // 2 // 32)) * width, 1) if args[2] > 1 else args[2])
+            # if m is C2fAttn:  # set 1) embed channels and 2) num heads
+            #     args[1] = make_divisible(min(args[1], max_channels // 2) * width, 8)
+            #     args[2] = int(max(round(min(args[2], max_channels // 2 // 32)) * width, 1) if args[2] > 1 else args[2])
 
+            # args = [c1, c2, *args[1:]]
+            # if m in repeat_modules:
+            #     args.insert(2, n)  # number of repeats
+            #     n = 1
+            # if m is C3k2:  # for M/L/X sizes
+            #     legacy = False
+            #     if scale in "mlx":
+            #         args[3] = True
             args = [c1, c2, *args[1:]]
-            if m in repeat_modules:
+            if m in {
+                BottleneckCSP,
+                C1,
+                C2,
+                C2f,
+                C3,
+                C3TR,
+                C3Ghost,
+                C3x,
+                RepC3,
+            }:
                 args.insert(2, n)  # number of repeats
                 n = 1
-            if m is C3k2:  # for M/L/X sizes
-                legacy = False
-                if scale in "mlx":
-                    args[3] = True
         elif m is AIFI:
             args = [ch[f], *args]
+        elif m is SemanticAlignmenCalibration:
+            c1 = [ch[x] for x in f]
+            c2 = c1[0]
+            args = [c1]
         elif m in frozenset({HGStem, HGBlock}):
             c1, cm, c2 = ch[f], args[0], args[1]
             args = [c1, cm, c2, *args[2:]]
@@ -1052,11 +1134,11 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                 n = 1
         elif m is ResNetLayer:
             c2 = args[1] if args[3] else args[1] * 4
-        elif m is nn.BatchNorm2d:
+        elif m is torch.nn.BatchNorm2d:
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
-        elif m in frozenset({Detect, WorldDetect, Segment, Pose, OBB, ImagePoolingAttn, v10Detect}):
+        elif m in frozenset({Detect, Segment, Pose, OBB, ImagePoolingAttn, v10Detect}):
             args.append([ch[x] for x in f])
             if m is Segment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
@@ -1074,21 +1156,50 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             c2 = args[0]
             c1 = ch[f]
             args = [*args[1:]]
+        elif m in { DySample }:
+            c2 = ch[f]
+            args = [c2, *args]
+        elif m in {MFFF}:
+            c2 = ch[f]
+            args = [c2]
+        elif m is nn.BatchNorm2d:
+            args = [ch[f]]
+        elif m is Concat:
+            c2 = sum(ch[x] for x in f)
+        elif m is Blocks:
+            block_type = globals()[args[1]]
+            c1, c2 = ch[f], args[0] * block_type.expansion
+            args = [c1, args[0], block_type, *args[2:]]
+        elif m in {Detect,  Segment, Pose}:
+            args.append([ch[x] for x in f])
+            if m is Segment:
+                args[2] = make_divisible(min(args[2], max_channels) * width, 8)
+        elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
+            args.insert(1, [ch[x] for x in f])
         else:
             c2 = ch[f]
 
-        m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
-        t = str(m)[8:-2].replace("__main__.", "")  # module type
+        # m_ = torch.nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
+        # t = str(m)[8:-2].replace("__main__.", "")  # module type
+        if isinstance(c2, list) and m not in {}:
+            is_backbone = True
+            m_ = m
+            m_.backbone = True
+        else:
+            m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
+            t = str(m)[8:-2].replace('__main__.', '')  # module type
         m_.np = sum(x.numel() for x in m_.parameters())  # number params
-        m_.i, m_.f, m_.type = i, f, t  # attach index, 'from' index, type
+        # m_.i, m_.f, m_.type = i, f, t  # attach index, 'from' index, type
+        m_.i, m_.f, m_.type = i + 4 if is_backbone else i, f, t  # attach index, 'from' index, type
         if verbose:
             LOGGER.info(f"{i:>3}{str(f):>20}{n_:>3}{m_.np:10.0f}  {t:<45}{str(args):<30}")  # print
-        save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
+        # save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
+        save.extend(x % (i + 4 if is_backbone else i) for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
         layers.append(m_)
         if i == 0:
             ch = []
         ch.append(c2)
-    return nn.Sequential(*layers), sorted(save)
+    return torch.nn.Sequential(*layers), sorted(save)
 
 
 
@@ -1131,7 +1242,7 @@ def guess_model_task(model):
     Guess the task of a PyTorch model from its architecture or configuration.
 
     Args:
-        model (nn.Module | dict): PyTorch model or model configuration in YAML format.
+        model (torch.nn.Module | dict): PyTorch model or model configuration in YAML format.
 
     Returns:
         (str): Task of the model ('detect', 'segment', 'classify', 'pose').
@@ -1159,7 +1270,7 @@ def guess_model_task(model):
         with contextlib.suppress(Exception):
             return cfg2task(model)
     # Guess from PyTorch model
-    if isinstance(model, nn.Module):  # PyTorch model
+    if isinstance(model, torch.nn.Module):  # PyTorch model
         for x in "model.args", "model.model.args", "model.model.model.args":
             with contextlib.suppress(Exception):
                 return eval(x)["task"]
@@ -1175,8 +1286,8 @@ def guess_model_task(model):
                 return "pose"
             elif isinstance(m, OBB):
                 return "obb"
-            elif isinstance(m, (Detect, WorldDetect, v10Detect)):
-                return "detect"
+            # elif isinstance(m, (Detect, WorldDetect, v10Detect)):
+            #     return "detect"
 
     # Guess from model filename
     if isinstance(model, (str, Path)):
